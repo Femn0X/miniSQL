@@ -167,7 +167,7 @@ Multiple conditions are joined with `AND`.
 
 ## File Format
 
-Data is stored in a human-readable text format (`db.msql`):
+Data is stored in a compact `.msql` format (`db.msql`) and is not intended for manual editing:
 
 ```
 # MiniSQL database — .msql format v2
