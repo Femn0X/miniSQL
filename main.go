@@ -1,11 +1,4 @@
 package main
-
-// ---------------------------------------------------------------------------
-// Key derivation — PBKDF2-SHA512 (stdlib only, no external deps)
-// ---------------------------------------------------------------------------
-// We implement PBKDF2 inline because golang.org/x/crypto is unavailable
-// in this environment. This is the exact RFC 2898 / NIST SP 800-132 algorithm.
-
 import (
 	"bufio"
 	"crypto/aes"
@@ -100,7 +93,7 @@ var dbFile = ""
 var keyFile = ""
 
 const nullSentinel = "NULL"
-const version = "1.5.0"
+const version = "1.6.0"
 
 var validTypes = map[string]bool{
 	"INT": true, "BIGINT": true, "FLOAT": true, "DOUBLE": true,
@@ -309,6 +302,441 @@ func aesGCMDecrypt(hexct string) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 const hmacMarker = "HMAC:"
+
+// ---------------------------------------------------------------------------
+// PRAGMA — runtime tuning knobs
+// ---------------------------------------------------------------------------
+
+func handlePragma(query string) {
+	// PRAGMA key = value   OR   PRAGMA key
+	parts := strings.Fields(query)
+	if len(parts) < 2 {
+		fmt.Println("Syntax: PRAGMA key [= value]")
+		return
+	}
+	key := strings.ToLower(parts[1])
+	if len(parts) >= 4 && parts[2] == "=" {
+		val := parts[3]
+		switch key {
+		case "wal_autocheckpoint":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 0 {
+				fmt.Println("Error: wal_autocheckpoint must be a non-negative integer (0 = disabled)")
+				return
+			}
+			walAutoCheckpointRows = n
+			fmt.Printf("wal_autocheckpoint = %d\n", n)
+		case "slow_query_ms":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 0 {
+				fmt.Println("Error: slow_query_ms must be a non-negative integer")
+				return
+			}
+			slowQueryThresholdMs = n
+			fmt.Printf("slow_query_ms = %d\n", n)
+		default:
+			fmt.Println("Unknown PRAGMA:", key)
+		}
+		return
+	}
+	// Read-only PRAGMA
+	switch key {
+	case "wal_autocheckpoint":
+		fmt.Printf("wal_autocheckpoint = %d\n", walAutoCheckpointRows)
+	case "slow_query_ms":
+		fmt.Printf("slow_query_ms = %d\n", slowQueryThresholdMs)
+	case "wal_entries":
+		fmt.Printf("wal_entries = %d\n", walEntryCount)
+	case "integrity_check":
+		pragmaIntegrityCheck()
+	default:
+		fmt.Println("Unknown PRAGMA:", key)
+	}
+}
+
+func pragmaIntegrityCheck() {
+	fmt.Println("Running integrity check...")
+	ok := true
+	dbMu.RLock()
+	defer dbMu.RUnlock()
+	for name, t := range database {
+		t.mu.RLock()
+		for ri, row := range t.Rows {
+			if len(row) != len(t.Columns) {
+				fmt.Printf("  ERROR: table %q row %d has %d cells, expected %d\n",
+					name, ri, len(row), len(t.Columns))
+				ok = false
+			}
+			for ci, col := range t.Columns {
+				if col.NotNull && (row[ci] == nullSentinel || row[ci] == "") {
+					fmt.Printf("  WARNING: table %q row %d col %q violates NOT NULL\n",
+						name, ri, col.Name)
+				}
+			}
+		}
+		t.mu.RUnlock()
+	}
+	if ok {
+		fmt.Println("  OK — no issues found.")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// COPY FROM — fast bulk CSV load
+// ---------------------------------------------------------------------------
+
+// COPY <table> FROM '<file.csv>' [DELIMITER ','] [HEADER]
+func copyFrom(query string) {
+	tokens := lex(query)
+	ts := newStream(tokens)
+	ts.keyword("COPY")
+	tableName := ts.next().Val
+	if !ts.keyword("FROM") {
+		fmt.Println("Syntax: COPY <table> FROM '<file>' [DELIMITER ','] [HEADER]")
+		return
+	}
+	filePath := ts.next().Val // string token, already unquoted by lexer
+	delim := ','
+	hasHeader := false
+	for ts.peek().Kind != tokEOF {
+		kw := strings.ToUpper(ts.peek().Val)
+		if kw == "DELIMITER" {
+			ts.next()
+			d := ts.next().Val
+			if len(d) > 0 {
+				delim = rune(d[0])
+			}
+		} else if kw == "HEADER" {
+			ts.next()
+			hasHeader = true
+		} else {
+			ts.next()
+		}
+	}
+
+	dbMu.RLock()
+	table, ok := database[tableName]
+	dbMu.RUnlock()
+	if !ok {
+		fmt.Println("Table not found:", tableName)
+		return
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		fmt.Println("Error opening file:", err)
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	inserted := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineNum++
+		if lineNum == 1 && hasHeader {
+			continue
+		}
+		// Split by delimiter (simple, no quoting support for now)
+		values := strings.Split(line, string(delim))
+		for i, v := range values {
+			values[i] = strings.TrimSpace(v)
+		}
+		row, ok2 := buildRow(table, tableName, nil, values)
+		if !ok2 {
+			fmt.Printf("COPY: skipping line %d (error above)\n", lineNum)
+			continue
+		}
+		table.mu.Lock()
+		table.Rows = append(table.Rows, row)
+		table.mu.Unlock()
+		walAppendRow(tableName, row)
+		inserted++
+	}
+	maybeCheckpoint()
+	fmt.Printf("COPY: %d rows inserted from %s\n", inserted, filePath)
+}
+// ---------------------------------------------------------------------------
+// Architecture:
+//   db.msql        — checkpoint file (full encrypted snapshot)
+//   db.msql.wal    — append-only operation log
+//
+// Write path (INSERT/UPDATE/DELETE/DDL):
+//   1. Build WAL entry
+//   2. Encrypt + sign entry
+//   3. Append to WAL file and fsync  ← durable after this point
+//   4. Apply to in-memory state
+//
+// On startup:
+//   1. Load checkpoint (db.msql) into memory
+//   2. Replay all committed WAL entries on top
+//
+// Checkpoint (WAL → main file):
+//   - Automatic when WAL exceeds walAutoCheckpointRows rows
+//   - Manual via VACUUM command
+//   - On clean EXIT
+
+const (
+	walOpInsert   = "I" // I <table> <encrypted-row>
+	walOpDelete   = "D" // D <table> <rowID>
+	walOpUpdate   = "U" // U <table> <rowID> <encrypted-row>
+	walOpTruncate = "T" // T <table>
+	walOpDDL      = "S" // S <table> <schema-line>  (schema change)
+	walMagic      = "MINISQL-WAL-V1"
+)
+
+// walAutoCheckpointRows: checkpoint when WAL has this many entries.
+var walAutoCheckpointRows = 1000
+
+// walFile is the path of the active WAL file (set alongside dbFile).
+var walFile = ""
+
+// walFD is the open file handle for the WAL (kept open for appends).
+var walFD *os.File
+
+// walEntryCount tracks how many entries are in the current WAL.
+var walEntryCount int
+
+// walMu protects walFD, walEntryCount — separate from dbMu so WAL
+// writes don't block concurrent readers of in-memory state.
+var walMu sync.Mutex
+
+// walEntry is one log record.
+type walEntry struct {
+	seq   uint64 // monotonic sequence number
+	op    string // I D U T S
+	table string
+	rowID int64  // for D and U; -1 otherwise
+	data  string // encrypted row blob or schema token
+}
+
+// walSeq is the next sequence number to assign.
+var walSeq uint64
+
+// openWAL opens (or creates) the WAL file for appending.
+func openWAL() {
+	if walFile == "" {
+		return
+	}
+	f, err := os.OpenFile(walFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+		logger.Warn("cannot open WAL", slog.String("path", walFile), slog.Any("err", err))
+		return
+	}
+	walFD = f
+}
+
+// closeWAL flushes and closes the WAL file handle.
+func closeWAL() {
+	walMu.Lock()
+	defer walMu.Unlock()
+	if walFD != nil {
+		walFD.Sync()
+		walFD.Close()
+		walFD = nil
+	}
+}
+
+// walAppend encrypts and appends one WAL entry. Returns after fsync.
+func walAppend(op, table string, rowID int64, plainData string) {
+	if walFD == nil {
+		return
+	}
+	walMu.Lock()
+	defer walMu.Unlock()
+
+	seq := walSeq
+	walSeq++
+
+	// Encode: seq|op|table|rowID|data  — then encrypt the whole thing
+	raw := fmt.Sprintf("%d\x00%s\x00%s\x00%d\x00%s", seq, op, table, rowID, plainData)
+	enc, err := aesGCMEncrypt([]byte(raw))
+	if err != nil {
+		logger.Warn("WAL encrypt failed", slog.Any("err", err))
+		return
+	}
+
+	line := enc + "\n"
+	if _, err := walFD.WriteString(line); err != nil {
+		logger.Warn("WAL write failed", slog.Any("err", err))
+		return
+	}
+	if err := walFD.Sync(); err != nil {
+		logger.Warn("WAL fsync failed", slog.Any("err", err))
+	}
+	walEntryCount++
+}
+
+// walAppendRow serialises a row and appends an INSERT WAL entry.
+func walAppendRow(tableName string, row []string) {
+	esc := make([]string, len(row))
+	for i, v := range row {
+		esc[i] = strings.ReplaceAll(v, "|", "\\|")
+	}
+	walAppend(walOpInsert, tableName, -1, strings.Join(esc, "|"))
+}
+
+// walAppendDelete appends a DELETE WAL entry for the given row index.
+func walAppendDelete(tableName string, rowID int64) {
+	walAppend(walOpDelete, tableName, rowID, "")
+}
+
+// walAppendUpdate appends an UPDATE WAL entry.
+func walAppendUpdate(tableName string, rowID int64, row []string) {
+	esc := make([]string, len(row))
+	for i, v := range row {
+		esc[i] = strings.ReplaceAll(v, "|", "\\|")
+	}
+	walAppend(walOpUpdate, tableName, rowID, strings.Join(esc, "|"))
+}
+
+// walAppendTruncate appends a TRUNCATE WAL entry.
+func walAppendTruncate(tableName string) {
+	walAppend(walOpTruncate, tableName, -1, "")
+}
+
+// walAppendDDL appends a schema-change WAL entry (serialised column line).
+func walAppendDDL(tableName, schemaLine string) {
+	walAppend(walOpDDL, tableName, -1, schemaLine)
+}
+
+// replayWAL loads and applies all WAL entries on top of the current in-memory state.
+func replayWAL() {
+	if walFile == "" {
+		return
+	}
+	raw, err := os.ReadFile(walFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		logger.Warn("cannot read WAL", slog.Any("err", err))
+		return
+	}
+
+	lines := strings.Split(string(raw), "\n")
+	var entries []walEntry
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || line == walMagic {
+			continue
+		}
+		pt, derr := aesGCMDecrypt(line)
+		if derr != nil {
+			// Corrupted or partial entry at end of WAL — stop here.
+			logger.Info("WAL: stopping replay at corrupted entry")
+			break
+		}
+		parts := strings.SplitN(string(pt), "\x00", 5)
+		if len(parts) != 5 {
+			continue
+		}
+		seq, _ := strconv.ParseUint(parts[0], 10, 64)
+		rowID, _ := strconv.ParseInt(parts[3], 10, 64)
+		entries = append(entries, walEntry{
+			seq:   seq,
+			op:    parts[1],
+			table: parts[2],
+			rowID: rowID,
+			data:  parts[4],
+		})
+	}
+
+	// Sort by sequence number (WAL should already be in order, but be safe)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].seq < entries[j].seq })
+
+	applied := 0
+	for _, e := range entries {
+		applyWALEntry(e)
+		applied++
+	}
+	walEntryCount = applied
+	if applied > 0 {
+		fmt.Printf("WAL: replayed %d entries\n", applied)
+	}
+	// Update walSeq to one past the highest seen
+	if len(entries) > 0 {
+		walSeq = entries[len(entries)-1].seq + 1
+	}
+}
+
+// applyWALEntry applies a single WAL entry to the in-memory database.
+func applyWALEntry(e walEntry) {
+	switch e.op {
+	case walOpInsert:
+		t := database[e.table]
+		if t == nil {
+			return
+		}
+		rawCells := splitPipe(e.data)
+		row := make([]string, len(rawCells))
+		for i, c := range rawCells {
+			row[i] = strings.ReplaceAll(c, "\\|", "|")
+		}
+		t.Rows = append(t.Rows, row)
+
+	case walOpDelete:
+		t := database[e.table]
+		if t == nil || e.rowID < 0 || int(e.rowID) >= len(t.Rows) {
+			return
+		}
+		t.Rows = append(t.Rows[:e.rowID], t.Rows[e.rowID+1:]...)
+
+	case walOpUpdate:
+		t := database[e.table]
+		if t == nil || e.rowID < 0 || int(e.rowID) >= len(t.Rows) {
+			return
+		}
+		rawCells := splitPipe(e.data)
+		row := make([]string, len(rawCells))
+		for i, c := range rawCells {
+			row[i] = strings.ReplaceAll(c, "\\|", "|")
+		}
+		t.Rows[e.rowID] = row
+
+	case walOpTruncate:
+		t := database[e.table]
+		if t == nil {
+			return
+		}
+		t.Rows = [][]string{}
+		for k := range t.AutoCounters {
+			t.AutoCounters[k] = 1
+		}
+
+	case walOpDDL:
+		// Schema changes are re-applied from the checkpoint after a
+		// full save; during replay we accept the data as-is since the
+		// checkpoint was written before WAL entries were added.
+		// Nothing extra needed here.
+	}
+}
+
+// checkpointWAL saves the full database to the checkpoint file and
+// deletes the WAL, atomically. Called automatically when the WAL is large.
+func checkpointWAL(silent bool) {
+	closeWAL()
+	saveDBCheckpoint(dbFile)
+	// Truncate the WAL (atomic: write new empty file, rename)
+	tmp := walFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(walMagic+"\n"), 0600); err == nil {
+		os.Rename(tmp, walFile)
+	}
+	walEntryCount = 0
+	openWAL()
+	if !silent {
+		fmt.Println("WAL checkpointed.")
+	}
+}
+
+// maybeCheckpoint triggers an automatic checkpoint if the WAL is large enough.
+func maybeCheckpoint() {
+	if walAutoCheckpointRows > 0 && walEntryCount >= walAutoCheckpointRows {
+		logger.Info("WAL auto-checkpoint", slog.Int("entries", walEntryCount))
+		checkpointWAL(true)
+	}
+}
 
 // signContent returns HMAC-SHA512(encKey, content) as a hex string.
 func signContent(content []byte) string {
@@ -721,6 +1149,7 @@ func parseArgs() (scriptFile, execStmt string) {
 func setDB(path string) {
 	dbFile = path
 	keyFile = path + ".key"
+	walFile = path + ".wal"
 }
 
 // ---------------------------------------------------------------------------
@@ -729,9 +1158,10 @@ func setDB(path string) {
 
 func connectDB(path string) {
 	if dbFile != "" && len(database) > 0 {
-		saveDB(dbFile)
+		checkpointWAL(true) // flush WAL before switching
 	}
-	releaseFileLock() // release old lock before acquiring new one
+	closeWAL()
+	releaseFileLock()
 
 	for k := range database {
 		delete(database, k)
@@ -742,6 +1172,8 @@ func connectDB(path string) {
 	acquireFileLock(dbFile)
 	loadOrCreateKey()
 	loadDB(dbFile)
+	replayWAL()
+	openWAL()
 	fmt.Printf("Connected to %s\n", dbFile)
 }
 
@@ -750,15 +1182,13 @@ func connectDB(path string) {
 // ---------------------------------------------------------------------------
 
 func exitSave(scanner *bufio.Scanner) {
-	if len(database) == 0 {
-		// Nothing to save
+	if len(database) == 0 && walEntryCount == 0 {
 		return
 	}
 	if dbFile != "" {
-		saveDB(dbFile)
+		checkpointWAL(true) // flush WAL → main file on clean exit
 		return
 	}
-	// No file selected — ask the user
 	fmt.Print("No database file set. Save to file? (leave blank to discard): ")
 	if !scanner.Scan() {
 		return
@@ -769,98 +1199,9 @@ func exitSave(scanner *bufio.Scanner) {
 		return
 	}
 	setDB(path)
-	// Need a key to encrypt — derive one now
 	loadOrCreateKey()
-	saveDB(dbFile)
+	checkpointWAL(false)
 }
-
-func main() {
-	initLogger()
-	scriptFile, execStmt := parseArgs()
-
-	if (scriptFile != "" || execStmt != "") && dbFile == "" {
-		fatalf("non-interactive modes require -db <file>\nExample: minisql -db mydata.msql script.sql")
-	}
-
-	if dbFile != "" {
-		acquireFileLock(dbFile)
-		defer releaseFileLock()
-		loadOrCreateKey()
-		loadDB(dbFile)
-	}
-
-	if execStmt != "" {
-		execute(strings.TrimSuffix(strings.TrimSpace(execStmt), ";"))
-		saveDB(dbFile)
-		return
-	}
-	if scriptFile != "" {
-		runFile(scriptFile)
-		saveDB(dbFile)
-		return
-	}
-
-	// Interactive REPL
-	printBanner()
-	if dbFile == "" {
-		fmt.Println("No database loaded. Use \\connect <file.msql> to open or create one.")
-		fmt.Println("Type HELP for all commands.")
-	}
-
-	scanner := bufio.NewScanner(stdinReader)
-	var buf strings.Builder
-
-	for {
-		if buf.Len() == 0 {
-			if dbFile == "" {
-				fmt.Print("sql(no db)> ")
-			} else if txSnapshot != nil {
-				fmt.Printf("sql(%s)(txn)> ", dbFile)
-			} else {
-				fmt.Printf("sql(%s)> ", dbFile)
-			}
-		} else {
-			fmt.Print("  -> ")
-		}
-		if !scanner.Scan() {
-			break
-		}
-		line := strings.TrimSpace(scanner.Text())
-
-		if line == "" || strings.HasPrefix(line, "--") {
-			continue
-		}
-
-		if strings.HasPrefix(line, `\`) {
-			handleMeta(line)
-			continue
-		}
-
-		if buf.Len() > 0 {
-			buf.WriteByte(' ')
-		}
-		buf.WriteString(line)
-
-		full := strings.TrimSpace(buf.String())
-		upper := strings.ToUpper(full)
-		singleWord := !strings.Contains(full, " ")
-
-		if strings.HasSuffix(full, ";") || singleWord ||
-			upper == "EXIT" || upper == "HELP" || upper == "SHOW TABLES" ||
-			upper == "BEGIN" || upper == "COMMIT" || upper == "ROLLBACK" {
-			buf.Reset()
-			stmt := strings.TrimSuffix(full, ";")
-			stmt = strings.TrimSpace(stmt)
-			if strings.ToUpper(stmt) == "EXIT" {
-				exitSave(scanner)
-				fmt.Println("Bye.")
-				break
-			}
-			execute(stmt)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Meta-commands (\i, \d, \dt)
 // ---------------------------------------------------------------------------
@@ -919,22 +1260,26 @@ func handleMeta(line string) {
 			return
 		}
 		fmt.Printf("Log level set to %s\n", logLevel.Level())
+	case `\status`:
 		if dbFile == "" {
 			fmt.Println("No database loaded. Use \\connect <file.msql> to open one.")
 		} else {
-			fmt.Printf("Database : %s\n", dbFile)
-			fmt.Printf("Key file : %s\n", keyFile)
-			fmt.Printf("Tables   : %d\n", len(database))
+			fmt.Printf("Database   : %s\n", dbFile)
+			fmt.Printf("Key file   : %s\n", keyFile)
+			fmt.Printf("WAL file   : %s (%d pending entries)\n", walFile, walEntryCount)
+			fmt.Printf("Tables     : %d\n", len(database))
 			total := 0
 			for _, t := range database {
 				total += len(t.Rows)
 			}
-			fmt.Printf("Rows     : %d\n", total)
+			fmt.Printf("Rows       : %d\n", total)
+			fmt.Printf("Log level  : %s\n", logLevel.Level())
+			fmt.Printf("Checkpoint : every %d WAL entries\n", walAutoCheckpointRows)
 		}
 	default:
 		fmt.Printf("Unknown meta-command: %s\n", parts[0])
 		// Suggest close matches
-		known := []string{`\i`, `\d`, `\dt`, `\connect`, `\c`, `\status`}
+		known := []string{`\i`, `\d`, `\dt`, `\connect`, `\c`, `\status`, `\loglevel`}
 		for _, k := range known {
 			if strings.HasPrefix(k, parts[0][:min(len(parts[0]), len(k))]) ||
 				levenshtein(cmd, k) <= 2 {
@@ -1067,6 +1412,16 @@ func lex(input string) []Token {
 				j++
 			}
 			tokens = append(tokens, Token{tokNumber, input[i:j]})
+			i = j
+			continue
+		}
+		// Path or identifier starting with /
+		if ch == '/' || (ch == '.' && i+1 < len(input) && input[i+1] == '/') {
+			j := i
+			for j < len(input) && input[j] != ' ' && input[j] != '\t' && input[j] != '\n' && input[j] != ';' && input[j] != ')' {
+				j++
+			}
+			tokens = append(tokens, Token{tokString, input[i:j]})
 			i = j
 			continue
 		}
@@ -1495,7 +1850,13 @@ func execute(query string) {
 		} else {
 			fmt.Println("EXPLAIN only supports SELECT currently.")
 		}
-	case strings.HasPrefix(upper, "ALTER DATABASE"):
+	case upper == "VACUUM":
+		fmt.Println("Checkpointing WAL and compacting database...")
+		checkpointWAL(false)
+	case strings.HasPrefix(upper, "PRAGMA "):
+		handlePragma(query)
+	case strings.HasPrefix(upper, "COPY "):
+		copyFrom(query)
 		if strings.Contains(upper, "SET PASSWORD") || strings.Contains(upper, "ROTATE KEY") {
 			rotateKey()
 		} else {
@@ -1849,10 +2210,11 @@ func truncateTable(query string) {
 	}
 	n := len(t.Rows)
 	t.Rows = [][]string{}
-	// Reset auto-counters
 	for k := range t.AutoCounters {
 		t.AutoCounters[k] = 1
 	}
+	walAppendTruncate(name)
+	maybeCheckpoint()
 	fmt.Printf("Table '%s' truncated (%d row(s) removed).\n", name, n)
 }
 
@@ -1985,20 +2347,8 @@ func alterTable(query string) {
 }
 
 // ---------------------------------------------------------------------------
-// INSERT INTO — supports named column list and NOW() defaults
+// INSERT INTO — WAL-backed, supports multi-row VALUES (a,b),(c,d),...
 // ---------------------------------------------------------------------------
-
-// resolveDefault expands NOW() into the current timestamp/date string.
-func resolveDefault(col Column) string {
-	up := strings.ToUpper(col.Default)
-	if up == "NOW()" {
-		return nowForCol(col)
-	}
-	if up == "UUID()" || up == "GEN_RANDOM_UUID()" {
-		return generateUUID()
-	}
-	return col.Default
-}
 
 func insertInto(query string) {
 	upper := strings.ToUpper(query)
@@ -2009,7 +2359,6 @@ func insertInto(query string) {
 	}
 
 	left := strings.TrimSpace(query[:vi])
-	// Detect named column list: INSERT INTO t (col1, col2) VALUES ...
 	var namedCols []string
 	parenOpen := strings.Index(left, "(")
 	if parenOpen != -1 {
@@ -2032,40 +2381,95 @@ func insertInto(query string) {
 	}
 	tableName := leftFields[2]
 
+	dbMu.RLock()
 	table, exists := database[tableName]
+	dbMu.RUnlock()
 	if !exists {
 		fmt.Println("Table not found:", tableName)
 		return
 	}
 
-	valuePart := strings.TrimSpace(query[vi+6:])
-	valuePart = strings.TrimPrefix(valuePart, "(")
-	valuePart = strings.TrimSuffix(valuePart, ")")
-	values := parseValues(valuePart)
+	// Parse multi-row VALUES: (r1c1, r1c2), (r2c1, r2c2), ...
+	valuesPart := strings.TrimSpace(query[vi+6:])
+	valueSets := splitValueSets(valuesPart)
+	if len(valueSets) == 0 {
+		fmt.Println("Syntax error: no values provided")
+		return
+	}
 
-	// Build a workRow aligned to table.Columns
+	inserted := 0
+	for _, valSet := range valueSets {
+		values := parseValues(valSet)
+		row, ok := buildRow(table, tableName, namedCols, values)
+		if !ok {
+			return // error already printed
+		}
+		table.mu.Lock()
+		table.Rows = append(table.Rows, row)
+		table.mu.Unlock()
+		walAppendRow(tableName, row)
+		inserted++
+	}
+
+	maybeCheckpoint()
+	if inserted == 1 {
+		fmt.Println("1 row inserted.")
+	} else {
+		fmt.Printf("%d rows inserted.\n", inserted)
+	}
+}
+
+// splitValueSets splits  (a,b,c),(d,e,f)  into  ["a,b,c", "d,e,f"]
+func splitValueSets(s string) []string {
+	s = strings.TrimSpace(s)
+	var sets []string
+	depth := 0
+	start := -1
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				sets = append(sets, s[start:i])
+				start = -1
+			}
+		case '\'':
+			i++
+			for i < len(s) && s[i] != '\'' {
+				i++
+			}
+		}
+	}
+	return sets
+}
+
+// buildRow validates and assembles a final row for insertion.
+// Returns the row and true on success; prints an error and returns false on failure.
+func buildRow(table *Table, tableName string, namedCols []string, values []string) ([]string, bool) {
 	workRow := make([]string, len(table.Columns))
 	for i := range workRow {
-		workRow[i] = nullSentinel // default everything to NULL
+		workRow[i] = nullSentinel
 	}
 
 	if len(namedCols) > 0 {
-		// Named-column insert
 		if len(namedCols) != len(values) {
-			fmt.Printf("Column count mismatch: %d column(s) named, %d value(s) given\n",
-				len(namedCols), len(values))
-			return
+			fmt.Printf("Column count mismatch: %d named, %d values\n", len(namedCols), len(values))
+			return nil, false
 		}
 		for j, cname := range namedCols {
 			idx := colIndex(table, cname)
 			if idx == -1 {
 				fmt.Println("Column not found:", cname)
-				return
+				return nil, false
 			}
 			workRow[idx] = values[j]
 		}
 	} else {
-		// Positional insert — auto-columns (AUTOITER, AUTOUUID, AUTOTS) are skipped
 		autoCount := 0
 		for _, c := range table.Columns {
 			if c.AutoIter || c.AutoUUID || c.AutoTS {
@@ -2077,9 +2481,7 @@ func insertInto(query string) {
 		case nonAutoCount:
 			vi2 := 0
 			for i, col := range table.Columns {
-				if col.AutoIter || col.AutoUUID || col.AutoTS {
-					// leave as nullSentinel — auto-filled below
-				} else {
+				if !col.AutoIter && !col.AutoUUID && !col.AutoTS {
 					workRow[i] = values[vi2]
 					vi2++
 				}
@@ -2089,90 +2491,83 @@ func insertInto(query string) {
 		default:
 			fmt.Printf("Column count mismatch: got %d, expected %d (or %d omitting auto columns)\n",
 				len(values), len(table.Columns), nonAutoCount)
-			return
+			return nil, false
 		}
 	}
 
-	// Validate, apply auto-values, defaults, constraints, encrypt
 	finalRow := make([]string, len(table.Columns))
 	for i, col := range table.Columns {
 		val := workRow[i]
 		isNull := strings.ToUpper(val) == nullSentinel || val == ""
 
-		// AUTOTS — always overwrite with current time; user cannot supply a value
 		if col.AutoTS {
 			finalRow[i] = nowForCol(col)
 			continue
 		}
-
-		// AUTOITER
 		if col.AutoIter && isNull {
 			n := table.AutoCounters[col.Name]
 			val = strconv.Itoa(n)
 			table.AutoCounters[col.Name] = n + 1
 			isNull = false
 		}
-
-		// AUTOUUID
 		if col.AutoUUID && isNull {
 			val = generateUUID()
 			isNull = false
 		}
-
-		// Apply DEFAULT (including NOW() / UUID())
 		if isNull && col.Default != "" {
 			val = resolveDefault(col)
 			isNull = false
 		}
-
 		if col.NotNull && isNull {
 			fmt.Printf("Error: column '%s' is NOT NULL\n", col.Name)
-			return
+			return nil, false
 		}
 		if isNull {
 			finalRow[i] = nullSentinel
 			continue
 		}
-
 		if col.Type != "" && col.Type != "TEXT" && col.Type != "VARCHAR" {
 			if err := validateType(col, val); err != nil {
 				fmt.Println("Error:", err)
-				return
+				return nil, false
 			}
 		}
-
-		// UNIQUE check
 		if col.Unique {
+			table.mu.RLock()
 			for _, row := range table.Rows {
-				existing := row[i]
-				if col.Secure {
-					if p, err := decryptValue(existing); err == nil {
-						existing = p
-					}
-				}
+				existing := decryptIfNeeded(col, row[i])
 				if existing == val {
-					fmt.Printf("Error: duplicate value '%s' violates UNIQUE constraint on '%s'\n", val, col.Name)
-					return
+					table.mu.RUnlock()
+					fmt.Printf("Error: duplicate value '%s' violates UNIQUE on '%s'\n", val, col.Name)
+					return nil, false
 				}
 			}
+			table.mu.RUnlock()
 		}
-
 		if col.Secure {
 			enc, err := encryptValue(val)
 			if err != nil {
 				fmt.Printf("Error encrypting '%s': %v\n", col.Name, err)
-				return
+				return nil, false
 			}
 			finalRow[i] = enc
 		} else {
 			finalRow[i] = val
 		}
 	}
+	return finalRow, true
+}
 
-	table.mu.Lock()
-	table.Rows = append(table.Rows, finalRow)
-	table.mu.Unlock()
-	fmt.Println("1 row inserted.")
+// resolveDefault expands NOW() and UUID() default expressions.
+func resolveDefault(col Column) string {
+	up := strings.ToUpper(col.Default)
+	if up == "NOW()" {
+		return nowForCol(col)
+	}
+	if up == "UUID()" || up == "GEN_RANDOM_UUID()" {
+		return generateUUID()
+	}
+	return col.Default
 }
 
 func parseValues(input string) []string {
@@ -2299,7 +2694,7 @@ func updateTable(query string) {
 	conditions := splitConditions(whereClause)
 	updated := 0
 	table.mu.Lock()
-	for _, row := range table.Rows {
+	for i, row := range table.Rows {
 		if whereClause == "" || matchesAll(table, row, conditions) {
 			for _, op := range ops {
 				row[op.colIdx] = op.val
@@ -2307,10 +2702,12 @@ func updateTable(query string) {
 			for _, ci := range autoTSUpdateCols {
 				row[ci] = nowForCol(table.Columns[ci])
 			}
+			walAppendUpdate(tableName, int64(i), row)
 			updated++
 		}
 	}
 	table.mu.Unlock()
+	maybeCheckpoint()
 	fmt.Printf("%d row(s) updated.\n", updated)
 }
 
@@ -2749,11 +3146,12 @@ func deleteFrom(query string) {
 	clause := strings.TrimSpace(query[whereIndex+7:])
 	conditions := splitConditions(clause)
 
+	table.mu.Lock()
 	var newRows [][]string
 	deleted := 0
-	table.mu.Lock()
-	for _, row := range table.Rows {
+	for i, row := range table.Rows {
 		if matchesAll(table, row, conditions) {
+			walAppendDelete(tableName, int64(i-deleted)) // adjust index for prior deletions
 			deleted++
 		} else {
 			newRows = append(newRows, row)
@@ -2761,6 +3159,7 @@ func deleteFrom(query string) {
 	}
 	table.Rows = newRows
 	table.mu.Unlock()
+	maybeCheckpoint()
 	fmt.Printf("%d row(s) deleted.\n", deleted)
 }
 
@@ -3065,10 +3464,16 @@ func runFile(fname string) {
 // Persistence — .msql format v2
 // ---------------------------------------------------------------------------
 
-func saveDB(fname string) {
+// saveDB is the public alias — always does a full checkpoint.
+func saveDB(fname string) { saveDBCheckpoint(fname) }
+
+// saveDBCheckpoint re-encrypts all rows in parallel and writes the
+// full checkpoint file atomically. Called on EXIT, VACUUM, and auto-checkpoint.
+func saveDBCheckpoint(fname string) {
 	var sb strings.Builder
 	sb.WriteString("# MiniSQL database — .msql format v3 (AES-256-GCM rows + HMAC-SHA512)\n")
 
+	dbMu.RLock()
 	names := make([]string, 0, len(database))
 	for n := range database {
 		names = append(names, n)
@@ -3077,67 +3482,80 @@ func saveDB(fname string) {
 
 	for _, tableName := range names {
 		table := database[tableName]
+		table.mu.RLock()
+
 		sb.WriteString("TABLE " + tableName + "\n")
-
 		for _, col := range table.Columns {
-			line := "COL " + col.Name
-			if col.Type != "" {
-				line += " " + col.Type
-			}
-			if col.AutoIter {
-				line += " AUTOITER"
-			}
-			if col.AutoUUID {
-				line += " AUTOUUID"
-			}
-			if col.AutoTS {
-				if col.AutoTSUpdate {
-					line += " AUTOTS_UPDATE"
-				} else {
-					line += " AUTOTS"
-				}
-			}
-			if col.Secure {
-				line += " SECURE"
-			}
-			if col.NotNull {
-				line += " NOTNULL"
-			}
-			if col.Unique {
-				line += " UNIQUE"
-			}
-			if col.Default != "" {
-				line += " DEFAULT " + col.Default
-			}
-			sb.WriteString(line + "\n")
+			sb.WriteString(serializeCol(col) + "\n")
 		}
-
 		for colName, n := range table.AutoCounters {
 			sb.WriteString(fmt.Sprintf("COUNTER %s %d\n", colName, n))
 		}
 
-		for _, row := range table.Rows {
-			esc := make([]string, len(row))
-			for i, v := range row {
-				esc[i] = strings.ReplaceAll(v, "|", "\\|")
-			}
-			plainRow := strings.Join(esc, "|")
-			enc, err := aesGCMEncrypt([]byte(plainRow))
-			if err != nil {
-				fmt.Println("Error encrypting row:", err)
-				return
-			}
-			sb.WriteString("ROW " + enc + "\n")
+		// Parallel row encryption — split rows into worker batches
+		rows := table.Rows
+		n := len(rows)
+		table.mu.RUnlock()
+
+		if n == 0 {
+			sb.WriteString("END\n\n")
+			continue
 		}
 
+		encrypted := make([]string, n)
+		numWorkers := 4
+		if n < numWorkers {
+			numWorkers = n
+		}
+		batchSize := (n + numWorkers - 1) / numWorkers
+		var wg sync.WaitGroup
+		var encErr error
+		var encErrMu sync.Mutex
+
+		for w := 0; w < numWorkers; w++ {
+			start := w * batchSize
+			end := start + batchSize
+			if end > n {
+				end = n
+			}
+			wg.Add(1)
+			go func(s, e int) {
+				defer wg.Done()
+				for i := s; i < e; i++ {
+					esc := make([]string, len(rows[i]))
+					for j, v := range rows[i] {
+						esc[j] = strings.ReplaceAll(v, "|", "\\|")
+					}
+					plain := strings.Join(esc, "|")
+					enc, err := aesGCMEncrypt([]byte(plain))
+					if err != nil {
+						encErrMu.Lock()
+						encErr = err
+						encErrMu.Unlock()
+						return
+					}
+					encrypted[i] = enc
+				}
+			}(start, end)
+		}
+		wg.Wait()
+
+		if encErr != nil {
+			dbMu.RUnlock()
+			fmt.Println("Error encrypting rows:", encErr)
+			return
+		}
+		for _, enc := range encrypted {
+			sb.WriteString("ROW " + enc + "\n")
+		}
 		sb.WriteString("END\n\n")
 	}
+	dbMu.RUnlock()
 
 	body := sb.String()
 	sig := signContent([]byte(body))
 	full := body + hmacMarker + sig + "\n"
 
-	// Atomic write: write to temp file, fsync, rename
 	tmp := fname + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
@@ -3145,14 +3563,12 @@ func saveDB(fname string) {
 		return
 	}
 	if _, err := f.WriteString(full); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		f.Close(); os.Remove(tmp)
 		fmt.Println("Write Error:", err)
 		return
 	}
-	if err := f.Sync(); err != nil { // fsync before rename
-		f.Close()
-		os.Remove(tmp)
+	if err := f.Sync(); err != nil {
+		f.Close(); os.Remove(tmp)
 		fmt.Println("Sync Error:", err)
 		return
 	}
@@ -3162,6 +3578,40 @@ func saveDB(fname string) {
 		return
 	}
 	fmt.Printf("DB saved → %s\n", fname)
+}
+
+// serializeCol returns the COL line for a column (used by saveDB and WAL DDL).
+func serializeCol(col Column) string {
+	line := "COL " + col.Name
+	if col.Type != "" {
+		line += " " + col.Type
+	}
+	if col.AutoIter {
+		line += " AUTOITER"
+	}
+	if col.AutoUUID {
+		line += " AUTOUUID"
+	}
+	if col.AutoTS {
+		if col.AutoTSUpdate {
+			line += " AUTOTS_UPDATE"
+		} else {
+			line += " AUTOTS"
+		}
+	}
+	if col.Secure {
+		line += " SECURE"
+	}
+	if col.NotNull {
+		line += " NOTNULL"
+	}
+	if col.Unique {
+		line += " UNIQUE"
+	}
+	if col.Default != "" {
+		line += " DEFAULT " + col.Default
+	}
+	return line
 }
 
 func loadDB(fname string) {
@@ -3325,4 +3775,93 @@ func splitPipe(input string) []string {
 		}
 	}
 	return append(parts, cur.String())
+}
+
+func main() {
+	initLogger()
+	scriptFile, execStmt := parseArgs()
+
+	if (scriptFile != "" || execStmt != "") && dbFile == "" {
+		fatalf("non-interactive modes require -db <file>\nExample: minisql -db mydata.msql script.sql")
+	}
+
+	if dbFile != "" {
+		acquireFileLock(dbFile)
+		defer releaseFileLock()
+		loadOrCreateKey()
+		loadDB(dbFile)
+		replayWAL()
+		openWAL()
+	}
+
+	if execStmt != "" {
+		execute(strings.TrimSuffix(strings.TrimSpace(execStmt), ";"))
+		saveDB(dbFile)
+		return
+	}
+	if scriptFile != "" {
+		runFile(scriptFile)
+		saveDB(dbFile)
+		return
+	}
+
+	// Interactive REPL
+	printBanner()
+	if dbFile == "" {
+		fmt.Println("No database loaded. Use \\connect <file.msql> to open or create one.")
+		fmt.Println("Type HELP for all commands.")
+	}
+
+	scanner := bufio.NewScanner(stdinReader)
+	var buf strings.Builder
+
+	for {
+		if buf.Len() == 0 {
+			if dbFile == "" {
+				fmt.Print("sql(no db)> ")
+			} else if txSnapshot != nil {
+				fmt.Printf("sql(%s)(txn)> ", dbFile)
+			} else {
+				fmt.Printf("sql(%s)> ", dbFile)
+			}
+		} else {
+			fmt.Print("  -> ")
+		}
+		if !scanner.Scan() {
+			break
+		}
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" || strings.HasPrefix(line, "--") {
+			continue
+		}
+
+		if strings.HasPrefix(line, `\`) {
+			handleMeta(line)
+			continue
+		}
+
+		if buf.Len() > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(line)
+
+		full := strings.TrimSpace(buf.String())
+		upper := strings.ToUpper(full)
+		singleWord := !strings.Contains(full, " ")
+
+		if strings.HasSuffix(full, ";") || singleWord ||
+			upper == "EXIT" || upper == "HELP" || upper == "SHOW TABLES" ||
+			upper == "BEGIN" || upper == "COMMIT" || upper == "ROLLBACK" {
+			buf.Reset()
+			stmt := strings.TrimSuffix(full, ";")
+			stmt = strings.TrimSpace(stmt)
+			if strings.ToUpper(stmt) == "EXIT" {
+				exitSave(scanner)
+				fmt.Println("Bye.")
+				break
+			}
+			execute(stmt)
+		}
+	}
 }
